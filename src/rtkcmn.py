@@ -585,7 +585,7 @@ def ecef2pos(r):
     v = rCST.RE_WGS84
     z = r[2]
     zk = 0
-    while abs(z - zk) >= 1e-4:
+    while abs(z - zk) >= 1e-6:
         zk = z
         sinp = z / np.sqrt(r2+z**2)
         v = rCST.RE_WGS84 / np.sqrt(1 - e2 * sinp**2)

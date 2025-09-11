@@ -25,8 +25,9 @@ def outsolstat(nav, sol, fp_stat):
     week, tow = gn.time2gpst(sol.t)
     
     # save position to file    
-    fp_stat.write('$POS,%d,%.3f,%d,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f\n' % 
-            (week, tow, sol.stat, sol.rr[0], sol.rr[1], sol.rr[2], 0.0, 0.0, 0.0))
+    fp_stat.write('$POS,%d,%.3f,%d,%.4f,%.4f,%.4f,%d,%.4f,%.4f,%.4f\n' %
+                (week, tow, sol.stat, sol.rr[0], sol.rr[1], sol.rr[2], sol.ns, 0.0, 0.0, 0.0))
+
     
     # save velocity to file
     pos = gn.ecef2pos(sol.rr)
@@ -996,6 +997,7 @@ def relpos(nav, obsr, obsb, sol):
         # calc double diff residuals again after kalman filter update for float solution 
         v, H, R = ddres(nav, xp, Pp, yr, er, yu, eu, sats, els, nav.dt, obsr)
         # validation of float solution, always returns 1, msg to trace file if large residual
+        nav.v = v.copy()  # ✅ CHÈN DÒNG NÀY Ở ĐÂY
         valpos(nav, v, R)
         
         # update state and covariance matrix from kalman filter update
@@ -1107,7 +1109,9 @@ def rtkpos(nav, rov, base, fp_stat, dir):
             nav.tt = timediff(sol.t, t) # timediff from previous epoch
         # relative solution
         relpos(nav, obsr, obsb, sol)
+        sol.ns = len(nav.v) // 2 if hasattr(nav, 'v') else 0  # fallback nếu chưa có sat_used
         outsolstat(nav, sol, fp_stat)
+        nav.sol.append(sol)  # ✅ Đảm bảo kết quả đsược ghi
         ep = gn.time2epoch(sol.t)
         stdout.write('\r   %2d/%2d/%4d %02d:%02d:%05.2f: %d' % (ep[1], ep[2], ep[0],
                 ep[3], ep[4], ep[5], sol.stat))
