@@ -1120,5 +1120,198 @@ def rtkpos(nav, rov, base, fp_stat, dir):
             break
     trace(3, 'rtkpos: end solution\n')
                 
+# Add these improvements to your rtkpos.py file:
 
+def relpos(nav, obsr, obsb, sol):
+    """relative positioning for PPK - improved to match RTKLib"""
+    
+    # time diff between rover and base
+    nav.dt = timediff(obsr.t, obsb.t)
+    trace(1,"\n---------------------------------------------------------\n")
+    trace(1, "relpos: dt=%.3f nu=%d nr=%d\n" % (nav.dt, len(obsr.sat), len(obsb.sat)))
+    trace(1,"---------------------------------------------------------\n")
+    
+    # RTKLib uses stricter age limit
+    if abs(nav.dt) > nav.maxage:
+        trace(3, 'Age of differential too large: %.2f\n' % nav.dt)
+        sol.stat = gn.SOLQ_NONE  # Set solution status
+        return
+    
+    # clear valid sat status
+    nav.vsat[:,:] = 0
+
+    # compute satellite positions, velocities and clocks
+    rs, var, dts, svh = satposs(obsr, nav)
+    rsb, varb, dtsb, svhb = satposs(obsb, nav)
+
+    # undifferenced residuals for base
+    trace(3, 'base station:\n')
+    yr, er, azelr = zdres(nav, obsb, rsb, dtsb, svhb, varb, nav.rb, 0)
+    if nav.interp_base:
+        yr0, _, _ = zdres(nav, nav.obsb, nav.rsb, nav.dtsb, nav.svhb, nav.varb,
+                          nav.rb, 0)
+        yr, nav.dt = intpres(obsr.t, nav, yr0, yr, nav.obsb, obsb)
+    
+    # find common sats between base and rover
+    ns, iu, ir = selsat(nav, obsr, obsb, azelr[:,1])
+    
+    # kalman filter time propagation
+    tracemat(3, 'before udstate: x=', nav.x[0:9], '.4f')
+    udstate(nav, obsr, obsb, iu, ir, sol)
+    tracemat(3, 'after udstate x=', nav.x[0:9], '.4f')
+    
+    if ns <= 0:
+        trace(3, 'no common sats: %d\n' % ns)
+        sol.stat = gn.SOLQ_NONE
+        return
+    
+    # save SNR values
+    for f in range(nav.nf):
+        nav.SNR_rover[obsr.sat[iu]-1,f] = obsr.S[iu,f]
+        nav.SNR_base[obsb.sat[ir]-1,f] = obsb.S[ir,f]
+
+    # undifferenced residuals for rover
+    trace(3, 'rover: dt=%.3f\n' % nav.dt)
+    yu, eu, azel = zdres(nav, obsr, rs, dts, svh, var, nav.x[0:3], 1)
+    rn.rcvstds(nav, obsr)
+
+    # remove non-common residuals
+    yr, er = yr[ir,:], er[ir,:]
+    yu, eu = yu[iu,:], eu[iu,:]
+    sats = obsr.sat[iu]
+    nav.azel[sats-1] = azel[iu]
+    els = azel[iu,1]
+    
+    # calculate double-differenced residuals
+    v, H, R = ddres(nav, nav.x, nav.P, yr, er, yu, eu, sats, els, nav.dt, obsr, True)
+    
+    # Check minimum observations like RTKLib
+    if len(v) < 4:
+        trace(3, 'not enough double-differenced residual\n')
+        stat = gn.SOLQ_NONE
+    else:
+        stat = gn.SOLQ_FLOAT
+    
+    if stat != gn.SOLQ_NONE:
+        # kalman filter measurement update
+        tracemat(3, 'before filter x=', nav.x[0:9], '.4f')
+        xp, Pp = gn.filter(nav.x, nav.P, H, v, R)
+        tracemat(3, 'after filter x=', xp[0:9], '.4f')
+        posvar = np.sum(np.diag(Pp[0:3])) / 3
+        trace(3,"posvar=%.6f \n" % posvar)
+
+        # Recalculate residuals with updated state
+        yu, eu, _ = zdres(nav, obsr, rs, dts, svh, var, xp[0:3], 1)
+        yu, eu = yu[iu,:], eu[iu,:]
+        v, H, R = ddres(nav, xp, Pp, yr, er, yu, eu, sats, els, nav.dt, obsr)
+        
+        # Store residuals for analysis
+        nav.v = v.copy()
+        valpos(nav, v, R)
+        
+        # Update state
+        nav.x = xp.copy()
+        nav.P = Pp.copy()
+        
+        # Update satellite status
+        for f in range(nav.nf):
+            ix = np.where(nav.vsat[:,f] > 0)[0]
+            nav.outc[ix,f] = 0
+            if f == 0:
+                nav.ns = len(ix)
+        
+        # Minimum satellite check like RTKLib
+        if nav.ns < 4:
+            stat = gn.SOLQ_DGPS
+            
+    # Integer ambiguity resolution
+    if nav.armode > 0 and stat == gn.SOLQ_FLOAT:
+        nb, xa = manage_amb_LAMBDA(nav, sats, stat, posvar)
+        if nb > 0:
+            yu, eu, azel = zdres(nav, obsr, rs, dts, svh, var, xa[0:3], 1)
+            yu, eu, el = yu[iu, :], eu[iu, :], azel[iu,1]
+            v, H, R = ddres(nav, xa, nav.P, yr, er, yu, eu, sats, el, nav.dt, obsr)
+            
+            if valpos(nav, v, R):
+                nav.nfix += 1
+                if nav.armode == 3 and nav.nfix >= nav.minfix:
+                    holdamb(nav, xa)
+                stat = gn.SOLQ_FIX
+        
+    # Save solution based on status
+    if stat == gn.SOLQ_FIX: 
+        sol.rr = nav.xa[0:6].copy()
+        sol.qr = nav.Pa[0:3,0:3].copy()
+        sol.qv = nav.Pa[3:6,3:6].copy() if nav.Pa.shape[0] >= 6 else np.zeros((3,3))
+    else:
+        sol.rr = nav.x[0:6].copy()
+        sol.qr = nav.P[0:3,0:3].copy()
+        sol.qv = nav.P[3:6,3:6].copy() if nav.P.shape[0] >= 6 else np.zeros((3,3))
+        nav.nfix = 0
+    
+    sol.stat = stat
+    sol.ratio = nav.ratio
+    sol.age = nav.dt
+    sol.ns = nav.ns  # Set number of satellites
+    
+    # Only append solution once
+    nav.sol.append(sol)
+    nav.rr = sol.rr[0:3]
+    
+    # Save observation history for cycle slip detection
+    for i, sat in enumerate(sats):
+        for f in range(nav.nf):
+            if obsb.L[ir[i],f] != 0:
+                nav.pt[0,sat-1,f] = obsb.t
+                nav.ph[0,sat-1,f] = obsb.L[ir[i],f]
+            if obsr.L[iu[i],f] != 0:
+                nav.pt[1,sat-1,f] = obsr.t
+                nav.ph[1,sat-1,f] = obsr.L[iu[i],f]
+    
+    # Save LLI and fix status
+    nav.slip[:,:] = 0
+    for f in range(nav.nf):
+        ix0 = np.where((obsb.L[:,f] != 0) | (obsb.lli[:,f] != 0))[0]
+        ix1 = np.where((obsr.L[:,f] != 0) | (obsr.lli[:,f] != 0))[0]
+        nav.prev_lli[obsb.sat[ix0]-1,f,0] = obsb.lli[ix0,f]
+        nav.prev_lli[obsr.sat[ix1]-1,f,1] = obsr.lli[ix1,f]
+    
+    if nav.armode > 0:
+        nav.prev_fix = copy(nav.fix)
+        for f in range(nav.nf):
+            ix = np.where(((nav.nb_ar > 0) & (nav.fix[:,f] >= 2)) | (nav.lock[:,f] < 0))[0]
+            nav.lock[ix,f] += 1
+
+
+# Additional function to improve time handling like RTKLib
+def improved_next_obs(nav, rov, base, dir):
+    """Improved observation synchronization like RTKLib"""
+    rov.index += dir
+    if abs(dir) != 1 or rov.index < 0 or rov.index >= len(rov.obslist):
+        return [], []
+    
+    obsr = rov.obslist[rov.index]
+    obsb = base.obslist[base.index]
+    dt = timediff(obsr.t, obsb.t)
+    
+    # More sophisticated base synchronization like RTKLib
+    best_dt = abs(dt)
+    best_index = base.index
+    
+    # Search for better time match
+    search_range = min(10, len(base.obslist))
+    for offset in range(-search_range, search_range + 1):
+        test_index = base.index + offset * dir
+        if test_index < 0 or test_index >= len(base.obslist):
+            continue
+        
+        test_dt = abs(timediff(obsr.t, base.obslist[test_index].t))
+        if test_dt < best_dt:
+            best_dt = test_dt
+            best_index = test_index
+    
+    base.index = best_index
+    obsb = base.obslist[base.index]
+    
+    return obsr, obsb
 
