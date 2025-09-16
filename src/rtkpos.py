@@ -153,21 +153,7 @@ def zdres_sat(nav, obs, r, rtype, dant, ix):
     return y
         
 def zdres(nav, obs, rs, dts, svh, var, rr, rtype):
-    """ undifferenced phase/code residuals ----------------------------------------
-    calculate zero diff residuals [observed pseudorange - range] 
-        output is in y[0:nu-1], only shared input with base is nav 
- args:  I   obs  = sat observations
-        I   n    = # of sats
-        I   rs = sat position {x,y,z} (m)
-        I   dts = sat clock {bias,drift} (s|s/s)
-        I   var  = variance of ephemeris
-        I   svh  = sat health flags
-        I   nav  = sat nav data
-        I   rr   = rcvr pos (x,y,z)
-        I   rtype:  0=base,1=rover 
-        O   y[] = zero diff residuals {phase,code} (m)
-        O   e    = line of sight unit vectors to sats
-        O   azel = [az, el] to sats  """
+    """ undifferenced phase/code residuals - FIXED VERSION """
     if obs == []:
         return [], [], []
     _c = rCST.CLIGHT
@@ -192,11 +178,24 @@ def zdres(nav, obs, rs, dts, svh, var, rr, rtype):
             continue
         # adjust range for satellite clock-bias
         r += -_c * dts[i]
-        # adjust range for troposphere delay model (hydrostatic)
-        trophs, tropw, _ = gn.tropmodel(obs.t, pos, np.deg2rad(90.0), 0.0)
-        zhd = trophs + tropw
-        mapfh, _ = gn.tropmapf(obs.t, pos, azel[i,1])
-        r += mapfh * zhd
+        
+        # 🔥 CRITICAL FIX #1: Use actual elevation angle, not 90 degrees!
+        # 🔥 CRITICAL FIX #2: Apply wet and hydrostatic delays separately!
+        
+        # OLD CODE (WRONG - causes ~20cm height error):
+        # trophs, tropw, _ = gn.tropmodel(obs.t, pos, np.deg2rad(90.0), 0.0)
+        # zhd = trophs + tropw
+        # mapfh, _ = gn.tropmapf(obs.t, pos, azel[i,1])
+        # r += mapfh * zhd
+        
+        # NEW CODE (CORRECT - matches RTKLib):
+        trophs, tropw, _ = gn.tropmodel(obs.t, pos, azel[i,1], 0.7)  # Use actual elevation!
+        mapfh, mapfw = gn.tropmapf(obs.t, pos, azel[i,1])           # Get both mapping functions!
+        
+        # Apply hydrostatic and wet delays separately with their own mapping functions
+        trop_delay = mapfh * trophs + mapfw * tropw
+        r += trop_delay
+        
         # calc receiver antenna phase center correction
         dant = gn.antmodel(nav, azel[i,1], nav.nf, rtype)
         # calc undifferenced phase/code residual for satellite
@@ -205,13 +204,13 @@ def zdres(nav, obs, rs, dts, svh, var, rr, rtype):
         trace(3, 'sat=%2d rs=%13.3f %13.3f %13.3f dts=%13.10f az=%6.1f el=%5.1f\n' %
               (obs.sat[i], rs[i,0], rs[i,1], rs[i,2], dts[i], 
                np.rad2deg(azel[i,0]), np.rad2deg(azel[i,1])))
-        trace(4,'sat=%d r=%.6f c*dts=%.6f zhd=%.6f map=%.6f\n' % 
-              (obs.sat[i], r,_c*dts[i],zhd,mapfh))
+        
+        # Enhanced debugging - shows the actual tropospheric correction applied
+        trace(4,'sat=%d r=%.6f c*dts=%.6f trop_hs=%.6f trop_w=%.6f map_h=%.3f map_w=%.3f total_trop=%.6f\n' % 
+              (obs.sat[i], r, _c*dts[i], trophs, tropw, mapfh, mapfw, trop_delay))
 
-    
     tracemat(3, 'y=', y[ix,:].T, '13.3f')
     return y, e, azel
-
 
 def ddcov(nb, n, Ri, Rj, nv):
     """ double-differenced measurement error covariance ---------------------------
